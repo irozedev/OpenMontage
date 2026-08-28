@@ -139,10 +139,35 @@ class ReelSpec:
         return self.project_dir / "assets" / "video" / f"picture_master_{self.variant}.mp4"
 
     def artifact(self, key: str) -> Any:
+        """Load a declared artifact, or None if it is not declared or not there.
+
+        A declared-but-missing file is a spec problem, not a crash — the doctor
+        reports it by name via :meth:`artifact_problem`.
+        """
         rel = self.raw.get(key)
         if not rel:
             return None
-        return json.loads(self.path(rel).read_text(encoding="utf-8"))
+        p = self.path(rel)
+        if not p.exists():
+            return None
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+
+    def artifact_problem(self, key: str) -> Optional[str]:
+        """Say what is wrong with a declared artifact, or None if it is fine."""
+        rel = self.raw.get(key)
+        if not rel:
+            return None
+        p = self.path(rel)
+        if not p.exists():
+            return f"{key} is declared as {rel!r} but that file does not exist"
+        try:
+            json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            return f"{key} at {rel!r} is not readable JSON: {exc}"
+        return None
 
     def a(self, name: str) -> str:
         """A variant-tagged path inside the audio dir, as a forward-slash string."""
@@ -156,6 +181,8 @@ class ReelSpec:
 def stage_picture(spec: ReelSpec, force: bool, log: list[str]) -> dict[str, Any]:
     """Cut, stabilise, grade and scale every segment; pull live audio."""
     cutlist = spec.artifact("cutlist")
+    if not cutlist:
+        return {"error": spec.artifact_problem("cutlist") or "no cutlist to build from"}
     cuts = cutlist["cuts"] if isinstance(cutlist, dict) else cutlist
     for d in (spec.seg_dir, spec.live_dir, spec.stab_dir):
         d.mkdir(parents=True, exist_ok=True)
@@ -228,6 +255,8 @@ def stage_picture(spec: ReelSpec, force: bool, log: list[str]) -> dict[str, Any]
 def stage_assemble(spec: ReelSpec, force: bool, log: list[str]) -> dict[str, Any]:
     """Concat cuts into blocks, then chain the blocks with xfade transitions."""
     cutlist = spec.artifact("cutlist")
+    if not cutlist:
+        return {"error": spec.artifact_problem("cutlist") or "no cutlist to assemble"}
     cuts = cutlist["cuts"] if isinstance(cutlist, dict) else cutlist
     raw_trans = cutlist.get("transitions") if isinstance(cutlist, dict) else None
     transitions = {t["after"]: t for t in (raw_trans or [])}
@@ -710,7 +739,7 @@ class ReelBuilder(BaseTool):
         "Install FFmpeg with libvidstab and libx264: https://ffmpeg.org/download.html\n"
         "Verify with: ffmpeg -filters | grep vidstab"
     )
-    agent_skills = ["ffmpeg", "video-editing", "sound-design", "video-stitching"]
+    agent_skills = ["ffmpeg", "video-edit", "video-toolkit"]
     capabilities = [
         "cut_segments_from_source_footage",
         "stabilise_and_grade_segments",
@@ -1006,7 +1035,7 @@ class ReelDoctor(BaseTool):
 
     dependencies = ["cmd:ffprobe"]
     install_instructions = "Install FFmpeg: https://ffmpeg.org/download.html"
-    agent_skills = ["ffmpeg", "video-editing"]
+    agent_skills = ["ffmpeg", "video-edit"]
     capabilities = ["validate_reel_spec", "preflight_before_render"]
     best_for = [
         "Catching a missing clip or an out-of-range cut before an hour of encoding",
@@ -1069,9 +1098,15 @@ class ReelDoctor(BaseTool):
 
         _check_environment(spec, rep)
 
+        for key in ("cutlist", "timeline", "vo_script", "loud_windows"):
+            problem = spec.artifact_problem(key)
+            if problem:
+                rep.error(problem)
+
         cutlist = spec.artifact("cutlist")
         if not cutlist:
-            rep.error("no cutlist — there is nothing to cut")
+            if not spec.artifact_problem("cutlist"):
+                rep.error("no cutlist — there is nothing to cut")
             return ToolResult(success=True, data={"ok": False, "errors": rep.errors,
                                                   "warnings": rep.warnings, "checks": rep.checks},
                               duration_seconds=time.time() - start)
