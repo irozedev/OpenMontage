@@ -826,3 +826,294 @@ class ReelBuilder(BaseTool):
             cost_usd=0.0,
             duration_seconds=time.time() - start,
         )
+
+
+# --------------------------------------------------------------------------- #
+# doctor
+# --------------------------------------------------------------------------- #
+
+class _Report:
+    """Errors block the build; warnings are worth reading but not fatal."""
+
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+        self.warnings: list[str] = []
+        self.checks: dict[str, Any] = {}
+
+    def error(self, msg: str) -> None:
+        self.errors.append(msg)
+
+    def warn(self, msg: str) -> None:
+        self.warnings.append(msg)
+
+
+def _probe_cache(path: str, cache: dict[str, Optional[float]]) -> Optional[float]:
+    if path not in cache:
+        cache[path] = _probe_duration(path)
+    return cache[path]
+
+
+def _check_sources(spec: ReelSpec, cuts: list[dict], rep: _Report,
+                   cache: dict[str, Optional[float]]) -> None:
+    """Every cut must point at a file that exists and be inside its runtime."""
+    missing: set[str] = set()
+    overruns: list[str] = []
+    for c in cuts:
+        src = spec.source_dir / (c["src"] + c.get("ext", ".MOV"))
+        if not src.exists():
+            missing.add(src.name)
+            continue
+        if c["out"] <= c["in"]:
+            rep.error(f"cut {c['id']}: out ({c['out']}) is not after in ({c['in']})")
+            continue
+        dur = _probe_cache(str(src), cache)
+        if dur is not None and c["out"] > dur + 0.05:
+            overruns.append(f"cut {c['id']} wants {c['out']:.2f}s of {src.name}, which is {dur:.2f}s long")
+    for m in sorted(missing):
+        rep.error(f"source clip not found: {m}")
+    for o in overruns:
+        rep.error(o)
+    rep.checks["sources_ok"] = not missing and not overruns
+
+
+def _check_timeline(spec: ReelSpec, cuts: list[dict], rep: _Report) -> None:
+    """Live cuts need a timeline slot, and the reel needs a declared length."""
+    timeline = spec.artifact("timeline") or {}
+    if not timeline:
+        rep.warn("no timeline artifact — live audio cannot be placed")
+        return
+
+    missing = [c["id"] for c in cuts if c.get("live") and c["id"] not in timeline]
+    for cid in missing:
+        rep.error(f"cut {cid} carries live sound but has no timeline entry")
+
+    if spec.total:
+        late = []
+        for cid, at in timeline.items():
+            start = float(at[0] if isinstance(at, (list, tuple)) else at)
+            if start > spec.total:
+                late.append(f"{cid} starts at {start:.2f}s, past the {spec.total}s end")
+        for line in late:
+            rep.warn(line)
+    rep.checks["timeline_ok"] = not missing
+
+
+def _check_voiceover(spec: ReelSpec, rep: _Report) -> None:
+    """Every scripted line needs a rendered clip, or it silently vanishes."""
+    vo = spec.artifact("vo_script")
+    if not vo:
+        rep.checks["voiceover"] = "none"
+        return
+    lines = vo.get("lines") if isinstance(vo, dict) else vo
+    vo_dir = spec.path(spec.raw.get("vo_audio_dir") or f"assets/audio/vo_{spec.variant}")
+    if not vo_dir.exists():
+        rep.error(f"voiceover directory not found: {vo_dir}")
+        return
+
+    missing = [line["id"] for line in lines if not (vo_dir / f"{line['id']}.mp3").exists()]
+    for mid in missing:
+        rep.error(f"voiceover clip missing: {mid}.mp3")
+    if spec.total:
+        for line in lines:
+            if float(line["at"]) > spec.total:
+                rep.warn(f"voiceover line {line['id']} is placed at {line['at']}s, past the end")
+    rep.checks["voiceover"] = f"{len(lines) - len(missing)}/{len(lines)} clips present"
+
+
+def _check_audio_beds(spec: ReelSpec, rep: _Report, cache: dict[str, Optional[float]]) -> None:
+    """Ambience takes, music segments and any extra bed must all resolve."""
+    amb = spec.raw.get("ambience") or {}
+    for s in amb.get("sources") or []:
+        p = spec.source_dir / s["src"]
+        if not p.exists():
+            rep.error(f"ambience take not found: {s['src']}")
+            continue
+        dur = _probe_cache(str(p), cache)
+        want = float(s.get("ss", 0)) + float(s["t"])
+        if dur is not None and want > dur + 0.05:
+            rep.error(f"ambience take {s['src']}: wants {want:.2f}s but the clip is {dur:.2f}s")
+
+    music = spec.raw.get("music") or {}
+    if music.get("track"):
+        track = spec.path(music["track"])
+        if not track.exists():
+            rep.error(f"music track not found: {music['track']}")
+        else:
+            dur = _probe_cache(str(track), cache)
+            for i, seg in enumerate(music.get("segments") or []):
+                want = float(seg.get("source_start", 0)) + float(seg["duration"])
+                if dur is not None and want > dur + 0.05:
+                    rep.error(f"music segment {i}: wants {want:.2f}s of a {dur:.2f}s track")
+                if spec.total and float(seg.get("at", 0)) >= spec.total:
+                    rep.warn(f"music segment {i} starts at {seg.get('at')}s, past the end")
+
+    for extra in spec.raw.get("extra_beds") or []:
+        if not spec.path(extra["path"]).exists():
+            rep.warn(f"extra bed not found, it will be skipped: {extra['path']}")
+
+
+def _check_delivery(spec: ReelSpec, rep: _Report, cache: dict[str, Optional[float]]) -> None:
+    """The graphics render has to exist and match the reel's length."""
+    gfx_rel = spec.raw.get("graphics")
+    if gfx_rel:
+        gfx = spec.path(gfx_rel)
+        if not gfx.exists():
+            rep.error(f"graphics render not found: {gfx_rel}")
+        else:
+            dur = _probe_cache(str(gfx), cache)
+            rep.checks["graphics_seconds"] = dur
+            if dur and spec.total and abs(dur - spec.total) > 0.5:
+                rep.warn(f"graphics is {dur:.2f}s but the reel is {spec.total}s — "
+                         "-shortest will trim to whichever ends first")
+
+    names = {d["name"] for d in spec.raw.get("deliverables") or []}
+    if len(names) != len(spec.raw.get("deliverables") or []):
+        rep.error("two deliverables share a filename — one would overwrite the other")
+    if not names:
+        rep.warn("no deliverables declared — the deliver stage will produce nothing")
+
+    has_music = bool((spec.raw.get("music") or {}).get("segments"))
+    for d in spec.raw.get("deliverables") or []:
+        if d["mix"] == "mix_music" and not has_music:
+            rep.error(f"deliverable {d['name']} asks for the music mix, but no music is configured")
+
+
+def _check_environment(spec: ReelSpec, rep: _Report) -> None:
+    """ffmpeg has to be there, and it has to have vidstab if we plan to use it."""
+    import shutil
+    for exe in ("ffmpeg", "ffprobe"):
+        if not shutil.which(exe):
+            rep.error(f"{exe} is not on PATH")
+    if spec.stabilize and shutil.which("ffmpeg"):
+        filters = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
+                                 capture_output=True, text=True).stdout
+        if "vidstabdetect" not in filters:
+            rep.error(f"{len(spec.stabilize)} cuts ask for stabilisation but this "
+                      "ffmpeg has no vidstab — rebuild it with --enable-libvidstab")
+
+
+class ReelDoctor(BaseTool):
+    """Check a reel spec before committing to a long render."""
+
+    name = "reel_doctor"
+    version = "0.1.0"
+    tier = ToolTier.CORE
+    capability = "analysis"
+    provider = "openmontage"
+    stability = ToolStability.BETA
+    execution_mode = ExecutionMode.SYNC
+    determinism = Determinism.DETERMINISTIC
+
+    dependencies = ["cmd:ffprobe"]
+    install_instructions = "Install FFmpeg: https://ffmpeg.org/download.html"
+    agent_skills = ["ffmpeg", "video-editing"]
+    capabilities = ["validate_reel_spec", "preflight_before_render"]
+    best_for = [
+        "Catching a missing clip or an out-of-range cut before an hour of encoding",
+        "Confirming a spec still resolves after footage has been moved",
+    ]
+    not_good_for = ["Judging whether the edit is any good"]
+
+    input_schema = {
+        "type": "object",
+        "required": ["spec"],
+        "properties": {
+            "spec": {"type": ["string", "object"]},
+            "probe": {"type": "boolean", "default": True,
+                      "description": "Probe every source with ffprobe. Slower, but the "
+                                     "only way to catch a cut that runs past the end of its clip."},
+        },
+    }
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "ok": {"type": "boolean"},
+            "errors": {"type": "array", "items": {"type": "string"}},
+            "warnings": {"type": "array", "items": {"type": "string"}},
+            "checks": {"type": "object"},
+        },
+    }
+
+    resource_profile = ResourceProfile(cpu_cores=1, ram_mb=256, disk_mb=1)
+    retry_policy = RetryPolicy(max_retries=0)
+    side_effects = ["reads media headers; writes nothing"]
+    user_visible_verification = ["Read the errors — each names the exact cut or file at fault"]
+
+    def get_status(self):
+        from tools.base_tool import ToolStatus
+        import shutil
+        return ToolStatus.AVAILABLE if shutil.which("ffprobe") else ToolStatus.UNAVAILABLE
+
+    def estimate_cost(self, inputs: dict[str, Any]) -> float:
+        return 0.0
+
+    def execute(self, inputs: dict[str, Any]) -> ToolResult:
+        start = time.time()
+        raw = inputs.get("spec")
+        if isinstance(raw, str):
+            p = Path(raw)
+            if not p.exists():
+                return ToolResult(success=False, error=f"spec not found: {raw}")
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return ToolResult(success=False, error="spec must be a path or an object")
+
+        try:
+            spec = ReelSpec(raw)
+        except KeyError as exc:
+            return ToolResult(success=False, error=f"spec is missing a required field: {exc}")
+
+        rep = _Report()
+        cache: dict[str, Optional[float]] = {}
+        probe = inputs.get("probe", True)
+
+        _check_environment(spec, rep)
+
+        cutlist = spec.artifact("cutlist")
+        if not cutlist:
+            rep.error("no cutlist — there is nothing to cut")
+            return ToolResult(success=True, data={"ok": False, "errors": rep.errors,
+                                                  "warnings": rep.warnings, "checks": rep.checks},
+                              duration_seconds=time.time() - start)
+
+        cuts = cutlist["cuts"] if isinstance(cutlist, dict) else cutlist
+        rep.checks["cuts"] = len(cuts)
+        rep.checks["reel_seconds"] = spec.total
+
+        ids = [c["id"] for c in cuts]
+        dupes = {i for i in ids if ids.count(i) > 1}
+        for d in sorted(dupes):
+            rep.error(f"cut id {d} appears more than once — segment files would collide")
+
+        unknown_stab = spec.stabilize - set(ids)
+        for s in sorted(unknown_stab):
+            rep.warn(f"stabilize lists {s}, which is not a cut in this cutlist")
+
+        if isinstance(cutlist, dict):
+            for t in cutlist.get("transitions") or []:
+                if t["after"] not in ids:
+                    rep.error(f"transition declared after cut {t['after']}, which does not exist")
+
+        planned = sum((c["out"] - c["in"]) / c.get("speed", 1.0) for c in cuts)
+        overlap = sum(t.get("duration", 0) for t in
+                      (cutlist.get("transitions") or [] if isinstance(cutlist, dict) else []))
+        expected = planned - overlap
+        rep.checks["expected_seconds"] = round(expected, 3)
+        if spec.total and abs(expected - spec.total) > 0.25:
+            rep.warn(f"cuts add up to {expected:.2f}s after transitions, but total_seconds "
+                     f"says {spec.total} — audio and picture will not line up")
+
+        if probe:
+            _check_sources(spec, cuts, rep, cache)
+        _check_timeline(spec, cuts, rep)
+        _check_voiceover(spec, rep)
+        if probe:
+            _check_audio_beds(spec, rep, cache)
+            _check_delivery(spec, rep, cache)
+
+        return ToolResult(
+            success=True,
+            data={"ok": not rep.errors, "errors": rep.errors,
+                  "warnings": rep.warnings, "checks": rep.checks},
+            duration_seconds=time.time() - start,
+        )
